@@ -9,12 +9,41 @@
  */
 #pragma once
 #include "wled.h"
+#include "Wire.h"
+#include "Adafruit_VL53L0X.h"
+
+
 
 class Animated_Staircase : public Usermod {
   private:
 
     /* configuration (available in API and stored in flash) */
     bool enabled = false;                   // Enable this usermod
+    
+    bool useV53l0x = false;                 // Use VL53L0X Laser Range Sensors
+    // address we will assign if dual sensor is present
+    #define LOX1_ADDRESS 0x41 // Default address should be 0x41
+    #define LOX2_ADDRESS 0x42
+
+    // set the pins to shutdown
+    //#define SHT_LOX1 13 //Top D7
+    //#define SHT_LOX2 12 //Bottom D6
+
+    // objects for the vl53l0x
+    Adafruit_VL53L0X loxTop = Adafruit_VL53L0X();
+    Adafruit_VL53L0X loxBot = Adafruit_VL53L0X();
+
+    // this holds the measurement
+    VL53L0X_RangingMeasurementData_t measure;
+    int16_t v53l0x_bottom_distance = -1;
+    int16_t v53l0x_top_distance    = -1;
+    int8_t topXSHUTPin             = -1;    // disabled
+    int8_t botXSHUTPin             = -1;    // disabled
+    bool topSensorFailed           = false;
+    bool botSensorFailed           = false;
+
+    //VL53L0X_RangingMeasurementData_t measureBot;
+
     unsigned long segment_delay_ms = 150;   // Time between switching each segment
     unsigned long on_time_ms       = 30000; // The time for the light to stay on
     int8_t topPIRorTriggerPin      = -1;    // disabled
@@ -90,16 +119,38 @@ class Animated_Staircase : public Usermod {
     static const char _bottomEcho_pin[];
     static const char _topEchoCm[];
     static const char _bottomEchoCm[];
+    static const char _useV53l0x[];
+    static const char _botXSHUT_pin[];
+    static const char _topXSHUT_pin[];
     
+    
+    
+    bool isDayTime() {
+      updateLocalTime();
+      uint8_t hr = hour(localTime);
+      uint8_t mi = minute(localTime);
+
+      if (sunrise && sunset) {
+        if (hour(sunrise)<hr && hour(sunset)>hr) {
+          return true;
+        } else {
+          if (hour(sunrise)==hr && minute(sunrise)<mi) {
+            return true;
+          }
+          if (hour(sunset)==hr && minute(sunset)>mi) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
     void publishMqtt(bool bottom, const char* state) {
-#ifndef WLED_DISABLE_MQTT
       //Check if MQTT Connected, otherwise it will crash the 8266
       if (WLED_MQTT_CONNECTED){
         char subuf[64];
         sprintf_P(subuf, PSTR("%s/motion/%d"), mqttDeviceTopic, (int)bottom);
         mqtt->publish(subuf, 0, false, state);
       }
-#endif
     }
 
     void updateSegments() {
@@ -155,23 +206,55 @@ class Animated_Staircase : public Usermod {
       return pulseIn(echoPin, HIGH, maxTimeUs) > 0;
     }
 
+    bool vl53l0xRead(Adafruit_VL53L0X &laser, unsigned int maxDist) {
+        
+        laser.rangingTest(&measure, false); // pass in 'true' to get debug data printout!
+        uint16_t mm = 999;
+        if(measure.RangeStatus != 4) {     // if not out of range
+         mm = measure.RangeMilliMeter;
+        } 
+        
+        loxBot.rangingTest(&measure,false);
+        v53l0x_bottom_distance = measure.RangeDMaxMilliMeter;
+        loxTop.rangingTest(&measure,false);
+        v53l0x_top_distance = measure.RangeDMaxMilliMeter;
+        if (mm>20) {
+          return (mm < maxDist ? true : false);
+        } else {
+          return false;
+        }
+        
+    }
+
+
     bool checkSensors() {
       bool sensorChanged = false;
 
       if ((millis() - lastScanTime) > scanDelay) {
         lastScanTime = millis();
 
-        bottomSensorRead = bottomSensorWrite ||
+        if (useV53l0x && (!(botSensorFailed)) ) {
+          bottomSensorRead = bottomSensorWrite || vl53l0xRead(loxBot, (bottomMaxDist * 10));
+        } else {
+          bottomSensorRead = bottomSensorWrite ||
           (!useUSSensorBottom ?
             (bottomPIRorTriggerPin<0 ? false : digitalRead(bottomPIRorTriggerPin)) :
             ultrasoundRead(bottomPIRorTriggerPin, bottomEchoPin, bottomMaxDist*59)  // cm to us
           );
-        topSensorRead = topSensorWrite ||
+
+        }
+        
+         if (useV53l0x && (!(topSensorFailed))) {
+          topSensorRead = topSensorWrite || vl53l0xRead(loxTop, (topMaxDist * 10));
+         } else {
+          topSensorRead = topSensorWrite ||
           (!useUSSensorTop ?
             (topPIRorTriggerPin<0 ? false : digitalRead(topPIRorTriggerPin)) :
             ultrasoundRead(topPIRorTriggerPin, topEchoPin, topMaxDist*59)   // cm to us
           );
 
+         }
+        
         if (bottomSensorRead != bottomSensorState) {
           bottomSensorState = bottomSensorRead; // change previous state
           sensorChanged = true;
@@ -225,6 +308,8 @@ class Animated_Staircase : public Usermod {
 
         // Swipe OFF in the direction of the last sensor detection
         swipe = lastSensor;
+        
+        //applyPreset(index, CALL_MODE_NO_NOTIFY);
         on = false;
 
         DEBUG_PRINT(F("OFF -> Swipe "));
@@ -273,20 +358,24 @@ class Animated_Staircase : public Usermod {
         DEBUG_PRINT(F(" milliseconds.\nStairs switch off after: "));
         DEBUG_PRINT(on_time_ms / 1000);
         DEBUG_PRINTLN(F(" seconds."));
+        if (!useV53l0x) {
+            if (!useUSSensorBottom)
+              pinMode(bottomPIRorTriggerPin, INPUT_PULLUP);
+            else {
+              pinMode(bottomPIRorTriggerPin, OUTPUT);
+              pinMode(bottomEchoPin, INPUT);
+            }
 
-        if (!useUSSensorBottom)
-          pinMode(bottomPIRorTriggerPin, INPUT_PULLUP);
-        else {
-          pinMode(bottomPIRorTriggerPin, OUTPUT);
-          pinMode(bottomEchoPin, INPUT);
-        }
+            if (!useUSSensorTop)
+              pinMode(topPIRorTriggerPin, INPUT_PULLUP);
+            else {
+              pinMode(topPIRorTriggerPin, OUTPUT);
+              pinMode(topEchoPin, INPUT);
+            }
+        } else {
 
-        if (!useUSSensorTop)
-          pinMode(topPIRorTriggerPin, INPUT_PULLUP);
-        else {
-          pinMode(topPIRorTriggerPin, OUTPUT);
-          pinMode(topEchoPin, INPUT);
         }
+        
         onIndex  = minSegmentId = strip.getMainSegmentId(); // it may not be the best idea to start with main segment as it may not be the first one
         offIndex = maxSegmentId = strip.getLastActiveSegmentId() + 1;
 
@@ -309,6 +398,38 @@ class Animated_Staircase : public Usermod {
       enabled = enable;
     }
 
+    void setID() {
+      // all reset
+      digitalWrite(topXSHUTPin, LOW);    
+      digitalWrite(botXSHUTPin, LOW);
+      delay(10);
+      // all unreset
+      digitalWrite(topXSHUTPin, HIGH);
+      digitalWrite(botXSHUTPin, HIGH);
+      delay(10);
+
+      // activating LOX1 and resetting LOX2
+      digitalWrite(topXSHUTPin, HIGH);
+      digitalWrite(botXSHUTPin, LOW);
+
+      // initing LOX1
+      if(!loxTop.begin(LOX1_ADDRESS)) {
+         DEBUG_PRINTLN(F("VL053L0X: Failed to boot first VL53L0X"));
+         topSensorFailed = true;
+      }
+      delay(10);
+
+      // activating LOX2
+      digitalWrite(botXSHUTPin, HIGH);
+      delay(10);
+
+      //initing LOX2
+      if(!loxBot.begin(LOX2_ADDRESS)) {
+         DEBUG_PRINTLN(F("VL053L0X: Failed to boot second VL53L0X"));
+         botSensorFailed = true;
+      }
+    }
+
   public:
     void setup() {
       // standardize invalid pin numbers to -1
@@ -316,22 +437,44 @@ class Animated_Staircase : public Usermod {
       if (topEchoPin            < 0) topEchoPin            = -1;
       if (bottomPIRorTriggerPin < 0) bottomPIRorTriggerPin = -1;
       if (bottomEchoPin         < 0) bottomEchoPin         = -1;
+
+      //V53L0X
+      if (botXSHUTPin           < 0) botXSHUTPin           = -1;
+      if (topXSHUTPin           < 0) topXSHUTPin           = -1;
+      
       // allocate pins
-      PinManagerPinType pins[4] = {
+      PinManagerPinType pins[6] = {
         { topPIRorTriggerPin, useUSSensorTop },
         { topEchoPin, false },
         { bottomPIRorTriggerPin, useUSSensorBottom },
         { bottomEchoPin, false },
+        { topXSHUTPin, false},
+        { botXSHUTPin, false},
       };
       // NOTE: this *WILL* return TRUE if all the pins are set to -1.
       //       this is *BY DESIGN*.
-      if (!pinManager.allocateMultiplePins(pins, 4, PinOwner::UM_AnimatedStaircase)) {
+      if (!pinManager.allocateMultiplePins(pins, 6, PinOwner::UM_AnimatedStaircase)) {
         topPIRorTriggerPin = -1;
         topEchoPin = -1;
         bottomPIRorTriggerPin = -1;
         bottomEchoPin = -1;
         enabled = false;
+        //V53L0X
+        topXSHUTPin = -1;
+        botXSHUTPin = -1;
       }
+
+      if (useV53l0x) {
+        pinMode(topXSHUTPin, OUTPUT);
+        pinMode(botXSHUTPin, OUTPUT);
+        DEBUG_PRINTLN(F("VL053L0X: Shutdown pins inited..."));
+        digitalWrite(topXSHUTPin, LOW);
+        digitalWrite(botXSHUTPin, LOW);
+        DEBUG_PRINTLN(F("VL053L0X: Both in reset mode...(pins are low)"));
+        DEBUG_PRINTLN(F("VL053L0X: Starting..."));
+        setID();
+      }
+
       enable(enabled);
       initDone = true;
     }
@@ -347,7 +490,6 @@ class Animated_Staircase : public Usermod {
 
     uint16_t getId() { return USERMOD_ID_ANIMATED_STAIRCASE; }
 
-#ifndef WLED_DISABLE_MQTT
     /**
      * handling of MQTT message
      * topic only contains stripped topic (part after /wled/MAC)
@@ -385,7 +527,6 @@ class Animated_Staircase : public Usermod {
         mqtt->subscribe(subuf, 0);
       }
     }
-#endif
 
     void addToJsonState(JsonObject& root) {
       JsonObject staircase = root[FPSTR(_name)];
@@ -411,6 +552,7 @@ class Animated_Staircase : public Usermod {
           String str = staircase[FPSTR(_enabled)]; // checkbox -> off or on
           en = (bool)(str!="off"); // off is guaranteed to be present
         }
+
         if (en != enabled) enable(en);
         readSensorsFromJson(staircase);
         DEBUG_PRINTLN(F("Staircase sensor state read from API."));
@@ -444,6 +586,11 @@ class Animated_Staircase : public Usermod {
       staircase[FPSTR(_bottomEcho_pin)]            = useUSSensorBottom ? bottomEchoPin : -1;
       staircase[FPSTR(_topEchoCm)]                 = topMaxDist;
       staircase[FPSTR(_bottomEchoCm)]              = bottomMaxDist;
+      staircase[FPSTR(_useV53l0x)]                 = useV53l0x;
+      staircase[FPSTR(_topXSHUT_pin)]              = topXSHUTPin;
+      staircase[FPSTR(_botXSHUT_pin)]              = botXSHUTPin;
+      
+
       DEBUG_PRINTLN(F("Staircase config saved."));
     }
 
@@ -459,6 +606,10 @@ class Animated_Staircase : public Usermod {
       int8_t oldTopBPin = topEchoPin;
       int8_t oldBottomAPin = bottomPIRorTriggerPin;
       int8_t oldBottomBPin = bottomEchoPin;
+
+      //V53L0X 
+      int8_t oldBotXSHUTPin = botXSHUTPin;
+      int8_t oldTopXSHUTPin = topXSHUTPin;
 
       JsonObject top = root[FPSTR(_name)];
       if (top.isNull()) {
@@ -488,6 +639,11 @@ class Animated_Staircase : public Usermod {
       bottomMaxDist = top[FPSTR(_bottomEchoCm)] | bottomMaxDist;
       bottomMaxDist = min(150,max(30,(int)bottomMaxDist));  // max distance ~1.5m (a lag of 9ms may be expected)
 
+      //V53L0X 
+      topXSHUTPin = top[FPSTR(_topXSHUT_pin)] | topXSHUTPin;
+      botXSHUTPin = top[FPSTR(_botXSHUT_pin)] | botXSHUTPin;
+      useV53l0x   = top[FPSTR(_useV53l0x)] | useV53l0x;
+
       DEBUG_PRINT(FPSTR(_name));
       if (!initDone) {
         // first run: reading from cfg.json
@@ -501,12 +657,19 @@ class Animated_Staircase : public Usermod {
             (oldTopAPin != topPIRorTriggerPin) ||
             (oldTopBPin != topEchoPin) ||
             (oldBottomAPin != bottomPIRorTriggerPin) ||
-            (oldBottomBPin != bottomEchoPin)) {
+            (oldBottomBPin != bottomEchoPin) ||
+            (oldBotXSHUTPin != botXSHUTPin) ||
+            (oldTopXSHUTPin != topXSHUTPin)) {
           changed = true;
           pinManager.deallocatePin(oldTopAPin, PinOwner::UM_AnimatedStaircase);
           pinManager.deallocatePin(oldTopBPin, PinOwner::UM_AnimatedStaircase);
           pinManager.deallocatePin(oldBottomAPin, PinOwner::UM_AnimatedStaircase);
           pinManager.deallocatePin(oldBottomBPin, PinOwner::UM_AnimatedStaircase);
+          //V53L0X
+          pinManager.deallocatePin(oldBotXSHUTPin, PinOwner::UM_AnimatedStaircase);
+          pinManager.deallocatePin(oldTopXSHUTPin, PinOwner::UM_AnimatedStaircase);
+          
+          DEBUG_PRINTLN(F(" config has changed -> Re-initialize.."));
         }
         if (changed) setup();
       }
@@ -535,6 +698,23 @@ class Animated_Staircase : public Usermod {
       uiDomString += enabled ? "on" : "off";
       uiDomString += F("\">&#xe08f;</i></button>");
       infoArr.add(uiDomString);
+
+      if (useV53l0x) {
+         JsonArray topRange = user.createNestedArray(F("V53L0X Top Range"));  
+         JsonArray botRange = user.createNestedArray(F("V53L0X Bottom Range"));
+         if (topSensorFailed) {
+            topRange.add(F("Sensor Failed!"));
+         } else {
+            topRange.add(v53l0x_top_distance);
+         } 
+         if (botSensorFailed) {
+          botRange.add(F("Bottom Sensor Failed!"));
+         } else {
+          botRange.add(v53l0x_bottom_distance);
+         }
+          
+      }
+     
     }
 };
 
@@ -551,3 +731,8 @@ const char Animated_Staircase::_bottomPIRorTrigger_pin[]    PROGMEM = "bottomPIR
 const char Animated_Staircase::_bottomEcho_pin[]            PROGMEM = "bottomEcho_pin";
 const char Animated_Staircase::_topEchoCm[]                 PROGMEM = "top-dist-cm";
 const char Animated_Staircase::_bottomEchoCm[]              PROGMEM = "bottom-dist-cm";
+const char Animated_Staircase::_useV53l0x[]                 PROGMEM = "Use_V53L0X_Laser_Sensor";
+const char Animated_Staircase::_topXSHUT_pin[]              PROGMEM = "V53L0X_Top_XSHUT_pin";
+const char Animated_Staircase::_botXSHUT_pin[]              PROGMEM = "V53L0X_Bottom_XSHUT_pin";
+
+
