@@ -1,7 +1,9 @@
 This is a Fork from Aircookie WLED. With some adjustmens to usermods
 
-- Staircase mode to include dual V53L0X sensor
+# Change/Added Usermod(s)
+- Staircase mod: Includes dual V53L0X sensor as triggering sensor
 
+<hr>
 <p align="center">
   <img src="/images/wled_logo_akemi.png">
   <a href="https://github.com/Aircoookie/WLED/releases"><img src="https://img.shields.io/github/release/Aircoookie/WLED.svg?style=flat-square"></a>
