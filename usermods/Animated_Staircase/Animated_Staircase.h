@@ -10,8 +10,7 @@
 #pragma once
 #include "wled.h"
 #include "Wire.h"
-#include "Adafruit_VL53L0X.h"
-
+#include <VL53L0X.h>
 
 
 class Animated_Staircase : public Usermod {
@@ -22,26 +21,24 @@ class Animated_Staircase : public Usermod {
     
     bool useV53l0x = false;                 // Use VL53L0X Laser Range Sensors
     // address we will assign if dual sensor is present
-    #define LOX1_ADDRESS 0x41 // Default address should be 0x41
-    #define LOX2_ADDRESS 0x42
+    #define LOXTOP_ADDRESS 0x41 // Default address should be 0x41
+    #define LOXBOT_ADDRESS 0x42
 
     // set the pins to shutdown
     //#define SHT_LOX1 13 //Top D7
     //#define SHT_LOX2 12 //Bottom D6
 
     // objects for the vl53l0x
-    Adafruit_VL53L0X loxTop = Adafruit_VL53L0X();
-    Adafruit_VL53L0X loxBot = Adafruit_VL53L0X();
+    VL53L0X loxBot; 
+    VL53L0X loxTop;
 
-    // this holds the measurement
-    VL53L0X_RangingMeasurementData_t measure;
     int16_t v53l0x_bottom_distance = -1;
     int16_t v53l0x_top_distance    = -1;
     int8_t topXSHUTPin             = -1;    // disabled
     int8_t botXSHUTPin             = -1;    // disabled
     bool topSensorFailed           = false;
     bool botSensorFailed           = false;
-
+    unsigned long showDebugData    = 0;
     //VL53L0X_RangingMeasurementData_t measureBot;
 
     unsigned long segment_delay_ms = 150;   // Time between switching each segment
@@ -206,18 +203,27 @@ class Animated_Staircase : public Usermod {
       return pulseIn(echoPin, HIGH, maxTimeUs) > 0;
     }
 
-    bool vl53l0xRead(Adafruit_VL53L0X &laser, unsigned int maxDist) {
+    bool vl53l0xRead(bool top, unsigned int maxDist) {
+        int16_t mm = 0;
+
+        if (top) {
+          v53l0x_top_distance = loxTop.readRangeContinuousMillimeters();
+          if (loxTop.timeoutOccurred()) {
+              v53l0x_top_distance = 999;
+              return false;
+          } else {
+            mm = v53l0x_top_distance;
+          }
+        } else { 
+          v53l0x_bottom_distance = loxBot.readRangeContinuousMillimeters();
+          if (loxBot.timeoutOccurred()) {
+              v53l0x_bottom_distance = 999;
+              return false;
+          } else {
+            mm = v53l0x_bottom_distance;
+          }
+        }
         
-        laser.rangingTest(&measure, false); // pass in 'true' to get debug data printout!
-        uint16_t mm = 999;
-        if(measure.RangeStatus != 4) {     // if not out of range
-         mm = measure.RangeMilliMeter;
-        } 
-        
-        loxBot.rangingTest(&measure,false);
-        v53l0x_bottom_distance = measure.RangeDMaxMilliMeter;
-        loxTop.rangingTest(&measure,false);
-        v53l0x_top_distance = measure.RangeDMaxMilliMeter;
         if (mm>20) {
           return (mm < maxDist ? true : false);
         } else {
@@ -228,13 +234,19 @@ class Animated_Staircase : public Usermod {
 
 
     bool checkSensors() {
+      if (millis() -  showDebugData > 9999) {
+        DEBUG_PRINTLN(F("---VL53L0X INFO---"));
+        DEBUG_PRINT(F("Top Distance: "));     DEBUG_PRINTLN(v53l0x_top_distance);
+        DEBUG_PRINT(F("Bot Distance: "));     DEBUG_PRINTLN(v53l0x_bottom_distance);
+        showDebugData = millis();
+      }
       bool sensorChanged = false;
 
       if ((millis() - lastScanTime) > scanDelay) {
         lastScanTime = millis();
 
         if (useV53l0x && (!(botSensorFailed)) ) {
-          bottomSensorRead = bottomSensorWrite || vl53l0xRead(loxBot, (bottomMaxDist * 10));
+          bottomSensorRead = bottomSensorWrite || vl53l0xRead(false, (bottomMaxDist * 10));
         } else {
           bottomSensorRead = bottomSensorWrite ||
           (!useUSSensorBottom ?
@@ -245,7 +257,7 @@ class Animated_Staircase : public Usermod {
         }
         
          if (useV53l0x && (!(topSensorFailed))) {
-          topSensorRead = topSensorWrite || vl53l0xRead(loxTop, (topMaxDist * 10));
+          topSensorRead = topSensorWrite || vl53l0xRead(true, (topMaxDist * 10));
          } else {
           topSensorRead = topSensorWrite ||
           (!useUSSensorTop ?
@@ -408,26 +420,32 @@ class Animated_Staircase : public Usermod {
       digitalWrite(botXSHUTPin, HIGH);
       delay(10);
 
-      // activating LOX1 and resetting LOX2
-      digitalWrite(topXSHUTPin, HIGH);
       digitalWrite(botXSHUTPin, LOW);
-
+      delay(10);
+      
+      //Only one address needs to be set, other sensor will use default I2C address
+      loxBot.setAddress(LOXBOT_ADDRESS);
+      delay(10);
+      digitalWrite(botXSHUTPin, HIGH);
       // initing LOX1
-      if(!loxTop.begin(LOX1_ADDRESS)) {
-         DEBUG_PRINTLN(F("VL053L0X: Failed to boot first VL53L0X"));
-         topSensorFailed = true;
+      if(!loxBot.init()) {
+         DEBUG_PRINTLN(F("VL053L0X: Failed to boot Bottom VL53L0X"));
+         botSensorFailed = true;
       }
       delay(10);
 
       // activating LOX2
-      digitalWrite(botXSHUTPin, HIGH);
-      delay(10);
-
+     
       //initing LOX2
-      if(!loxBot.begin(LOX2_ADDRESS)) {
-         DEBUG_PRINTLN(F("VL053L0X: Failed to boot second VL53L0X"));
-         botSensorFailed = true;
+      if(!loxTop.init()) {
+         DEBUG_PRINTLN(F("VL053L0X: Failed to Top VL53L0X"));
+         topSensorFailed = true;
       }
+
+      loxTop.setTimeout(500);
+      loxBot.setTimeout(500);
+      loxTop.startContinuous();
+      loxBot.startContinuous(); 
     }
 
   public:
@@ -473,6 +491,7 @@ class Animated_Staircase : public Usermod {
         DEBUG_PRINTLN(F("VL053L0X: Both in reset mode...(pins are low)"));
         DEBUG_PRINTLN(F("VL053L0X: Starting..."));
         setID();
+        showDebugData = millis();
       }
 
       enable(enabled);
@@ -486,6 +505,7 @@ class Animated_Staircase : public Usermod {
       checkSensors();
       if (on) autoPowerOff();
       updateSwipe();
+      
     }
 
     uint16_t getId() { return USERMOD_ID_ANIMATED_STAIRCASE; }
