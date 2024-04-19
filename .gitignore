@@ -16,6 +16,7 @@ wled-update.sh
 
 /build_output/
 /node_modules/
+package-lock.json
 
 /wled00/extLibs
 /wled00/LittleFS
